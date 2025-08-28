@@ -30,6 +30,13 @@ DEFAULT_MAX_RESULTS = 10
 DEFAULT_START = 0
 
 
+# Create the server object
+mcp = FastMCP("arXiv Papers Server")
+
+# HTTP client for arXiv API
+arxiv_client = httpx.AsyncClient(timeout=60.0)
+
+
 class ArxivPaper(BaseModel):
     """Represents an arXiv paper."""
 
@@ -52,9 +59,9 @@ class SearchParameters(BaseModel):
 
     # Query parameters (mutually exclusive with id_list)
     search_query: str | None = Field(default=None, description="Search query string")
-    id_list: str | list[str] | list[float] | list[int] | None = Field(
+    id_list: str | list[str] | None = Field(
         default=None,
-        description="Comma-separated list of arXiv IDs or list of arXiv IDs (strings/numbers)",
+        description="Comma-separated list of arXiv IDs or list of arXiv IDs (strings)",
     )
 
     # Common parameters
@@ -73,7 +80,7 @@ class SearchParameters(BaseModel):
         """Validate that search_query and id_list are mutually exclusive and convert list to string."""
         # Convert list id_list to comma-separated string
         if self.id_list and isinstance(self.id_list, list):
-            self.id_list = ",".join(str(id_val) for id_val in self.id_list)
+            self.id_list = ",".join(format_arxiv_id(id_val) for id_val in self.id_list)
 
         if self.search_query and self.id_list:
             raise ValueError("search_query and id_list cannot be used simultaneously")
@@ -81,11 +88,40 @@ class SearchParameters(BaseModel):
             raise ValueError("Either search_query or id_list must be provided")
 
 
-# Create the server object
-mcp = FastMCP("arXiv Papers Server")
+def format_arxiv_id(paper_id: str | int | float) -> str:
+    """
+    Safely format arXiv paper ID to string, preserving format.
 
-# HTTP client for arXiv API
-arxiv_client = httpx.AsyncClient(timeout=30.0)
+    Args:
+        paper_id: arXiv paper ID (string, int, or float)
+
+    Returns:
+        Properly formatted arXiv ID string
+    """
+    if isinstance(paper_id, str):
+        # Handle string input - ensure proper format
+        paper_id = paper_id.strip()
+        if "." in paper_id:
+            parts = paper_id.split(".")
+            if len(parts) == 2 and len(parts[0]) == 4 and parts[1].isdigit():
+                # Ensure at least 5 digits after decimal for arXiv format
+                if len(parts[1]) < 5:
+                    paper_id = f"{parts[0]}.{parts[1].ljust(5, '0')}"
+        return paper_id
+    elif isinstance(paper_id, float):
+        # Convert float to string with high precision then format
+        formatted = f"{paper_id:.5f}".rstrip("0").rstrip(".")
+
+        # Ensure we have proper arXiv format (YYMM.NNNNN)
+        if "." in formatted:
+            parts = formatted.split(".")
+            if len(parts) == 2 and len(parts[0]) == 4 and parts[1].isdigit():
+                # Ensure at least 5 digits after decimal for arXiv format
+                if len(parts[1]) < 5:
+                    formatted = f"{parts[0]}.{parts[1].ljust(5, '0')}"
+        return formatted
+    else:
+        return str(paper_id)
 
 
 async def parse_arxiv_response(xml_content: str) -> list[ArxivPaper]:
@@ -105,8 +141,7 @@ async def parse_arxiv_response(xml_content: str) -> list[ArxivPaper]:
                 continue
             paper_id = id_elem.text.split("/")[-1]
 
-            # Remove version suffix (v1, v2, etc.) for API compatibility
-            paper_id = paper_id.split("v")[0]
+            # Keep version number as returned by arXiv API
 
             # Extract title
             title_elem = entry.find("atom:title", namespace)
@@ -236,32 +271,63 @@ async def search_arxiv_papers(params: SearchParameters) -> list[ArxivPaper]:
 
 
 async def download_paper_pdf(
-    paper_id: str, save_path: str, paper_title: str | None = None
-) -> str:
+    paper_id: str, paper_title: str, save_directory: str | None = None
+) -> dict:
     """
-    Download a paper PDF from arXiv and save to the specified path.
+    Download a paper PDF from arXiv with automatic path creation.
 
     Args:
-        paper_id: arXiv paper ID
-        save_path: Path where to save the PDF file
-        paper_title: Optional paper title for logging
+        paper_id: arXiv paper ID (e.g., "2401.12345")
+        paper_title: Paper title for filename generation
+        save_directory: Optional directory path to save PDF. If not provided,
+                       uses default "papers" directory.
 
     Returns:
-        Success message with file path
+        Dictionary containing download result with file information
     """
-    # Remove version suffix (v1, v2, etc.) for API compatibility
-    clean_paper_id = paper_id.split("v")[0]
+    import re
+
+    paper_id_str = format_arxiv_id(paper_id)
+    # For PDF download, arXiv URLs work with or without version numbers
+    # Keep the original ID format as provided by user
+    clean_paper_id = paper_id_str
+
+    # Clean title for filename
+    clean_title = re.sub(r"[^\w\s-]", "", paper_title)
+    clean_title = re.sub(r"[-\s]+", "-", clean_title)
+    clean_title = clean_title.strip("-")
+
+    # Set up save directory and file path
+    if save_directory:
+        target_dir = save_directory
+    else:
+        target_dir = os.path.join(os.getcwd(), "papers")
+
+    # Ensure directory exists
+    os.makedirs(target_dir, exist_ok=True)
+
+    # Create filename and full path
+    filename = f"{clean_title[:100]}_{paper_id_str}.pdf"
+    save_path = os.path.join(target_dir, filename)
+
+    # Download the PDF
     pdf_url = f"{ARXIV_PDF_BASE}/{clean_paper_id}"
 
     try:
         response = await arxiv_client.get(pdf_url)
         response.raise_for_status()
 
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         async with aiofiles.open(save_path, "wb") as f:
             await f.write(response.content)
-        return f"PDF saved to: {save_path}"
+
+        return {
+            "paper_id": paper_id_str,
+            "title": paper_title,
+            "filename": filename,
+            "file_path": save_path,
+            "status": "success",
+            "message": f"PDF saved to: {save_path}",
+        }
 
     except httpx.HTTPStatusError as e:
         raise ToolError(
@@ -307,7 +373,7 @@ async def extract_text_from_pdf(pdf_path: str, max_pages: int = 10) -> str:
 @mcp.tool
 async def arxiv_query(
     search_query: str = "",
-    id_list: str | list[str] | list[float] | list[int] = "",
+    id_list: str | list[str] = "",
     max_results: int = DEFAULT_MAX_RESULTS,
     start: int = DEFAULT_START,
     sortBy: str = "relevance",
@@ -333,7 +399,6 @@ async def arxiv_query(
         id_list: Comma-separated list of arXiv IDs or list of arXiv IDs (alternative to search_query, mutually exclusive)
                 String example: "2401.12345,1909.03550,2312.11805"
                 List of strings: ["2401.12345", "1909.03550", "2312.11805"]
-                List of numbers: [2401.12345, 1909.03550, 2312.11805]
         max_results: Maximum results to return (1-2000, default: 10)
         start: Start index for pagination (default: 0)
         sortBy: Sort field - "relevance", "lastUpdatedDate", or "submittedDate"
@@ -350,13 +415,20 @@ async def arxiv_query(
     ID List Examples:
         arxiv_query(id_list="2401.12345,1909.03550")
         arxiv_query(id_list=["2401.12345", "1909.03550"])
-        arxiv_query(id_list=[2401.12345, 1909.03550])
 
-    Note: search_query and id_list cannot be used simultaneously.
+    Version Number Examples:
+        arxiv_query(id_list="1706.03762")      # Gets latest version
+        arxiv_query(id_list="1706.03762v1")    # Gets specific version v1
+        arxiv_query(id_list="1706.03762v5")    # Gets specific version v5
+
+    Note:
+    - search_query and id_list cannot be used simultaneously.
+    - Version numbers are preserved as specified by the user.
+    - Omitting version number returns the latest version of the paper.
     """
     # Convert list id_list to comma-separated string if needed
     if isinstance(id_list, list):
-        id_list = ",".join(str(id_val) for id_val in id_list)
+        id_list = ",".join(format_arxiv_id(id_val) for id_val in id_list)
 
     # Build SearchParameters based on the query type
     if id_list:
@@ -385,67 +457,173 @@ async def arxiv_query(
 
 @mcp.tool
 async def download_paper(
-    paper_id: str | int | float, save_directory: str | None = None
-) -> str:
+    paper_id: str | list[str],
+    save_directory: str | None = None,
+) -> str | dict:
     """
-    Download a paper PDF from arXiv to local storage.
+    Download one or more paper PDFs from arXiv to local storage.
 
     Args:
-        paper_id: arXiv paper ID (e.g., "2401.12345", "1909.03550", 2401.12345)
-        save_directory: Optional directory path to save PDF. If not provided,
+        paper_id: Single arXiv paper ID or list of paper IDs
+                 Single: "2401.12345", "1909.03550"
+                 List: ["2401.12345", "1909.03550"]
+                 Version numbers are preserved as specified by user
+        save_directory: Optional directory path to save PDF(s). If not provided,
                        uses default "papers" directory.
 
     Returns:
-        Success message with file path where PDF was saved
+        For single paper: Success message with file path where PDF was saved
+        For multiple papers: Dictionary with download results for each paper
 
     Examples:
-        download_paper("2401.12345")
-        download_paper(2401.12345)
+        # Single paper download
+        download_paper("2401.12345")        # Latest version
+        download_paper("2401.12345v1")      # Specific version v1
         download_paper("1909.03550", "/home/user/papers")
+
+        # Batch download
+        download_paper(["2401.12345", "1909.03550", "2312.11805"])
+        download_paper(["1706.03762v1", "1706.03762v5"])  # Different versions
+        download_paper(["2401.12345", "1909.03550"], "/home/user/papers")
     """
-    # Convert paper_id to string if it's a number
-    paper_id_str = str(paper_id)
-
-    # First get paper details to get the title
-    # Remove version suffix (v1, v2, etc.) for API compatibility
-    clean_paper_id = paper_id_str.split("v")[0]
-    params = SearchParameters(
-        search_query=f"id:{clean_paper_id}", max_results=1, start=0
-    )
-    papers = await search_arxiv_papers(params)
-
-    if not papers:
-        raise ToolError(f"Paper with ID {paper_id_str} not found")
-
-    title = papers[0].title
-
-    # Clean title for filename
-    import re
-
-    clean_title = re.sub(r"[^\w\s-]", "", title)
-    clean_title = re.sub(r"[-\s]+", "-", clean_title)
-    clean_title = clean_title.strip("-")
-
-    # Always create a save path - use provided directory or default directory
-    if save_directory:
-        # Use provided directory
-        filename = f"{clean_title[:100]}_{paper_id_str}.pdf"
-        save_path = os.path.join(save_directory, filename)
+    # Normalize input to always work with a list
+    if isinstance(paper_id, list):
+        paper_ids = paper_id
+        is_batch = True
     else:
-        # Use default directory
-        default_dir = os.path.join(os.getcwd(), "papers")
-        os.makedirs(default_dir, exist_ok=True)
-        filename = f"{clean_title[:100]}_{paper_id_str}.pdf"
-        save_path = os.path.join(default_dir, filename)
+        paper_ids = [paper_id]
+        is_batch = False
 
-    return await download_paper_pdf(clean_paper_id, save_path, title)
+    # Convert all IDs to strings and remove duplicates while preserving order
+    paper_id_strs = [format_arxiv_id(pid) for pid in paper_ids]
+    seen = set()
+    unique_ids = []
+    for pid in paper_id_strs:
+        if pid not in seen:
+            seen.add(pid)
+            unique_ids.append(pid)
+
+    # For batch processing, prepare results dictionary
+    if is_batch:
+        results = {
+            "total_requested": len(paper_ids),
+            "total_unique": len(unique_ids),
+            "successful_downloads": 0,
+            "failed_downloads": 0,
+            "downloads": [],
+            "errors": [],
+        }
+
+    # Get metadata for all papers efficiently using batch query
+    paper_map = {}
+    if len(unique_ids) > 1:
+        # Use batch query for multiple papers
+        try:
+            # Keep original IDs with version numbers as specified by user
+            params = SearchParameters(
+                id_list=unique_ids, max_results=len(unique_ids), start=0
+            )
+            papers = await search_arxiv_papers(params)
+            paper_map = {paper.id: paper for paper in papers}
+        except Exception as e:
+            if is_batch:
+                results["errors"].append(f"Failed to fetch batch metadata: {str(e)}")
+
+    # Process each paper
+    for paper_id_str in unique_ids:
+        try:
+            # Get paper title and info
+            if paper_id_str in paper_map:
+                paper = paper_map[paper_id_str]
+                title = paper.title
+            else:
+                # Individual query for this paper
+                try:
+                    params = SearchParameters(
+                        id_list=paper_id_str, max_results=1, start=0
+                    )
+                    individual_papers = await search_arxiv_papers(params)
+                    if individual_papers:
+                        title = individual_papers[0].title
+                    else:
+                        error_msg = f"Paper {paper_id_str} not found"
+                        if is_batch:
+                            results["errors"].append(error_msg)
+                            results["downloads"].append(
+                                {
+                                    "paper_id": paper_id_str,
+                                    "status": "failed",
+                                    "error": error_msg,
+                                }
+                            )
+                            results["failed_downloads"] += 1
+                            continue
+                        else:
+                            raise ToolError(error_msg)
+                except Exception as e:
+                    error_msg = f"Failed to get info for {paper_id_str}: {str(e)}"
+                    if is_batch:
+                        results["errors"].append(error_msg)
+                        results["downloads"].append(
+                            {
+                                "paper_id": paper_id_str,
+                                "status": "failed",
+                                "error": str(e),
+                            }
+                        )
+                        results["failed_downloads"] += 1
+                        continue
+                    else:
+                        raise ToolError(error_msg)
+
+            # Download the paper using the unified download function
+            download_result = await download_paper_pdf(
+                paper_id_str, title, save_directory
+            )
+
+            # Record result
+            if is_batch:
+                results["downloads"].append(download_result)
+                results["successful_downloads"] += 1
+            else:
+                # For single paper, return the message directly
+                return download_result["message"]
+
+        except Exception as e:
+            error_msg = f"Failed to download {paper_id_str}: {str(e)}"
+            if is_batch:
+                results["errors"].append(error_msg)
+                results["downloads"].append(
+                    {"paper_id": paper_id_str, "status": "failed", "error": str(e)}
+                )
+                results["failed_downloads"] += 1
+            else:
+                raise ToolError(error_msg)
+
+    # For batch processing, add summary and return results
+    if is_batch:
+        if results["successful_downloads"] == len(unique_ids):
+            results["summary"] = (
+                f"Successfully downloaded all {results['successful_downloads']} papers"
+            )
+        elif results["successful_downloads"] > 0:
+            results["summary"] = (
+                f"Downloaded {results['successful_downloads']} out of {len(unique_ids)} papers. "
+                f"{results['failed_downloads']} failed."
+            )
+        else:
+            results["summary"] = (
+                f"Failed to download any papers. All {len(unique_ids)} downloads failed."
+            )
+
+        return results
 
 
 @mcp.tool
 async def list_downloaded_papers(
     directory: str | None = None,
     include_content_preview: bool = False,
-    max_preview_chars: int = 500,
+    max_preview_chars: int = 1000,
 ) -> list[dict]:
     """
     List all downloaded arXiv papers in local storage.
@@ -549,9 +727,9 @@ async def list_downloaded_papers(
 @mcp.tool
 async def read_paper(
     filepath: str = "",
-    paper_id: str | int | float = "",
+    paper_id: str = "",
     max_pages: int = 10,
-    max_chars: int = 10000,
+    max_chars: int = 100000,
 ) -> str:
     """
     Read and extract text content from a downloaded arXiv paper PDF.
@@ -560,17 +738,16 @@ async def read_paper(
 
     Args:
         filepath: Direct path to PDF file to read
-        paper_id: arXiv paper ID to automatically locate downloaded file (string or number)
+        paper_id: arXiv paper ID to automatically locate downloaded file (string)
         max_pages: Maximum pages to extract (default: 10)
-        max_chars: Maximum characters to return (default: 10000)
+        max_chars: Maximum characters to return (default: 100000)
 
     Returns:
         Extracted text content from PDF with file information
 
     Examples:
         read_paper(filepath="/path/to/paper.pdf")
-        read_paper(paper_id="2401.12345", max_pages=5)
-        read_paper(paper_id=2401.12345, max_pages=5)
+        read_paper(paper_id="2401.12345", max_pages=15, max_chars=150000)
     """
     target_filepath = ""
 
@@ -579,7 +756,7 @@ async def read_paper(
         target_filepath = filepath
     elif paper_id:
         # Convert paper_id to string if it's a number
-        paper_id_str = str(paper_id)
+        paper_id_str = format_arxiv_id(paper_id)
 
         # Find file by paper ID - scan directory directly
         scan_dir = Path(os.getcwd()) / "papers"
@@ -601,8 +778,13 @@ async def read_paper(
         for pdf_file in pdf_files:
             filename = pdf_file.stem
             match = re.search(arxiv_pattern, filename)
-            if match and match.group(1).split("v")[0] == paper_id_str.split("v")[0]:
-                matching_files.append(str(pdf_file))
+            if match:
+                file_id = match.group(1)
+                # Support both exact match and base ID match (without version)
+                exact_match = file_id == paper_id_str
+                base_match = file_id.split("v")[0] == paper_id_str.split("v")[0]
+                if exact_match or base_match:
+                    matching_files.append(str(pdf_file))
 
         if not matching_files:
             # Try to find by filename pattern containing the ID
