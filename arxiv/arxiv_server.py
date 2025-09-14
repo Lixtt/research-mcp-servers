@@ -81,6 +81,16 @@ class SearchParameters(BaseModel):
         # Convert list id_list to comma-separated string
         if self.id_list and isinstance(self.id_list, list):
             self.id_list = ",".join(format_arxiv_id(id_val) for id_val in self.id_list)
+        # Handle case where id_list is a JSON string representation of a list
+        elif self.id_list and isinstance(self.id_list, str) and self.id_list.startswith('[') and self.id_list.endswith(']'):
+            try:
+                import json
+                parsed_list = json.loads(self.id_list)
+                if isinstance(parsed_list, list):
+                    self.id_list = ",".join(format_arxiv_id(id_val) for id_val in parsed_list)
+            except json.JSONDecodeError:
+                # If it's not valid JSON, treat it as a regular string
+                pass
 
         if self.search_query and self.id_list:
             raise ValueError("search_query and id_list cannot be used simultaneously")
@@ -307,7 +317,9 @@ async def download_paper_pdf(
     os.makedirs(target_dir, exist_ok=True)
 
     # Create filename and full path
-    filename = f"{clean_title[:100]}_{paper_id_str}.pdf"
+    # Limit title length to avoid filesystem issues
+    safe_title = clean_title[:80] if clean_title else "paper"
+    filename = f"{safe_title}_{paper_id_str}.pdf"
     save_path = os.path.join(target_dir, filename)
 
     # Download the PDF
@@ -367,6 +379,56 @@ async def extract_text_from_pdf(pdf_path: str, max_pages: int = 10) -> str:
         )
     except Exception as e:
         raise ToolError(f"Error reading PDF file: {str(e)}")
+
+
+async def extract_images_from_pdf(pdf_path: str, max_pages: int = 10, dpi: int = 150) -> list[dict]:
+    """
+    Extract pages from a PDF file as base64-encoded images.
+
+    Args:
+        pdf_path: Path to the PDF file
+        max_pages: Maximum number of pages to extract (default: 10)
+        dpi: Resolution for image conversion (default: 150)
+
+    Returns:
+        List of dictionaries containing page number and base64-encoded image data
+    """
+    try:
+        import fitz  # PyMuPDF
+        import base64
+
+        images = []
+        with fitz.open(pdf_path) as doc:
+            # Extract images from each page, up to max_pages
+            for page_num in range(min(len(doc), max_pages)):
+                page = doc.load_page(page_num)
+                
+                # Convert page to image (PNG format)
+                # The matrix determines the resolution - dpi/72 gives us the scaling factor
+                mat = fitz.Matrix(dpi / 72, dpi / 72)
+                pix = page.get_pixmap(matrix=mat)
+                
+                # Convert to PNG bytes
+                img_data = pix.pil_tobytes("PNG")
+                
+                # Encode to base64
+                img_b64 = base64.b64encode(img_data).decode('utf-8')
+                
+                images.append({
+                    "page_number": page_num + 1,
+                    "image_data": img_b64,
+                    "format": "png",
+                    "dpi": dpi
+                })
+
+        return images
+
+    except ImportError:
+        raise ToolError(
+            "PyMuPDF is required for PDF image extraction. Please install it with: pip install PyMuPDF"
+        )
+    except Exception as e:
+        raise ToolError(f"Error extracting images from PDF file: {str(e)}")
 
 
 # Tools - Native arXiv API forwarding
@@ -429,6 +491,16 @@ async def arxiv_query(
     # Convert list id_list to comma-separated string if needed
     if isinstance(id_list, list):
         id_list = ",".join(format_arxiv_id(id_val) for id_val in id_list)
+    # Handle case where id_list is a JSON string representation of a list
+    elif isinstance(id_list, str) and id_list.startswith('[') and id_list.endswith(']'):
+        try:
+            import json
+            parsed_list = json.loads(id_list)
+            if isinstance(parsed_list, list):
+                id_list = ",".join(format_arxiv_id(id_val) for id_val in parsed_list)
+        except json.JSONDecodeError:
+            # If it's not valid JSON, treat it as a regular string
+            pass
 
     # Build SearchParameters based on the query type
     if id_list:
@@ -494,8 +566,24 @@ async def download_paper(
         paper_ids = [paper_id]
         is_batch = False
 
+    # Handle case where paper_id might be a JSON string representation
+    processed_ids = []
+    for pid in paper_ids:
+        if isinstance(pid, str) and pid.startswith('[') and pid.endswith(']'):
+            try:
+                import json
+                parsed_list = json.loads(pid)
+                if isinstance(parsed_list, list):
+                    processed_ids.extend(parsed_list)
+                else:
+                    processed_ids.append(pid)
+            except json.JSONDecodeError:
+                processed_ids.append(pid)
+        else:
+            processed_ids.append(pid)
+    
     # Convert all IDs to strings and remove duplicates while preserving order
-    paper_id_strs = [format_arxiv_id(pid) for pid in paper_ids]
+    paper_id_strs = [format_arxiv_id(pid) for pid in processed_ids]
     seen = set()
     unique_ids = []
     for pid in paper_id_strs:
@@ -642,7 +730,7 @@ async def list_downloaded_papers(
     """
 
     # Determine directory to scan
-    if directory:
+    if directory and directory != "null" and directory.lower() != "none":
         scan_dir = Path(directory)
     else:
         scan_dir = Path(os.getcwd()) / "papers"
@@ -770,26 +858,28 @@ async def read_paper(
         pdf_files = list(scan_dir.glob("*.pdf"))
         matching_files = []
 
-        # Look for files with matching arXiv ID pattern
+        # Look for files with matching arXiv ID pattern - improved search
         import re
 
-        arxiv_pattern = r"(\d{4}\.\d{4,5}(v\d+)?)$"
+        arxiv_pattern = r"(\d{4}\.\d{4,5}(v\d+)?)"
 
         for pdf_file in pdf_files:
             filename = pdf_file.stem
-            match = re.search(arxiv_pattern, filename)
-            if match:
-                file_id = match.group(1)
+            # Try multiple patterns to find the arXiv ID in filename
+            matches = re.findall(arxiv_pattern, filename)
+            for match in matches:
+                file_id = match[0]  # match[0] contains the full ID with optional version
                 # Support both exact match and base ID match (without version)
                 exact_match = file_id == paper_id_str
                 base_match = file_id.split("v")[0] == paper_id_str.split("v")[0]
                 if exact_match or base_match:
                     matching_files.append(str(pdf_file))
+                    break
 
         if not matching_files:
             # Try to find by filename pattern containing the ID
             for pdf_file in pdf_files:
-                if paper_id_str in pdf_file.name:
+                if paper_id_str in pdf_file.name or paper_id_str.split("v")[0] in pdf_file.name:
                     matching_files.append(str(pdf_file))
 
         if not matching_files:
@@ -833,6 +923,444 @@ async def read_paper(
 
     except Exception as e:
         raise ToolError(f"Error reading paper: {str(e)}")
+
+
+# Note: read_paper_as_images is now implemented as MCP resources instead of a tool
+# Use get_paper_image_resources tool to get resource URIs, then reference them directly
+
+async def _extract_paper_images_internal(
+    filepath: str = "",
+    paper_id: str = "",
+    max_pages: int = 5,
+    dpi: int = 150,
+) -> list[dict]:
+    """
+    Read arXiv paper PDF and convert pages to base64-encoded images for visual analysis by AI models.
+    
+    This function provides an alternative to text extraction by converting PDF pages to images,
+    which allows AI models to see the paper's visual layout, formulas, figures, and formatting.
+
+    Provide either filepath OR paper_id to locate the file.
+
+    Args:
+        filepath: Direct path to PDF file to read
+        paper_id: arXiv paper ID to automatically locate downloaded file (string)
+        max_pages: Maximum pages to convert to images (default: 5, recommended for performance)
+        dpi: Image resolution in dots per inch (default: 150, higher = better quality but larger files)
+
+    Returns:
+        List of dictionaries with page images in base64 format:
+        [
+            {
+                "page_number": 1,
+                "image_data": "base64_encoded_png_data",
+                "format": "png",
+                "dpi": 150
+            },
+            ...
+        ]
+
+    Examples:
+        read_paper_as_images(filepath="/path/to/paper.pdf", max_pages=3)
+        read_paper_as_images(paper_id="2401.12345", max_pages=10, dpi=200)
+
+    Note:
+        - The returned images can be directly processed by AI models for visual analysis
+        - Higher DPI values produce better quality but larger image files
+        - Use max_pages wisely as images can be large - start with fewer pages
+        - PNG format preserves text clarity and mathematical formulas
+    """
+    target_filepath = ""
+
+    if filepath:
+        # Read by direct file path
+        target_filepath = filepath
+    elif paper_id:
+        # Convert paper_id to string if it's a number
+        paper_id_str = format_arxiv_id(paper_id)
+
+        # Find file by paper ID - scan directory directly
+        scan_dir = Path(os.getcwd()) / "papers"
+        if not scan_dir.exists():
+            raise ToolError(
+                f"No downloaded paper found with ID: {paper_id_str}. "
+                f"Use download_paper first to download the paper."
+            )
+
+        # Find all PDF files
+        pdf_files = list(scan_dir.glob("*.pdf"))
+        matching_files = []
+
+        # Look for files with matching arXiv ID pattern - improved search
+        import re
+
+        arxiv_pattern = r"(\d{4}\.\d{4,5}(v\d+)?)"
+
+        for pdf_file in pdf_files:
+            filename = pdf_file.stem
+            # Try multiple patterns to find the arXiv ID in filename
+            matches = re.findall(arxiv_pattern, filename)
+            for match in matches:
+                file_id = match[0]  # match[0] contains the full ID with optional version
+                # Support both exact match and base ID match (without version)
+                exact_match = file_id == paper_id_str
+                base_match = file_id.split("v")[0] == paper_id_str.split("v")[0]
+                if exact_match or base_match:
+                    matching_files.append(str(pdf_file))
+                    break
+
+        if not matching_files:
+            # Try to find by filename pattern containing the ID
+            for pdf_file in pdf_files:
+                if paper_id_str in pdf_file.name or paper_id_str.split("v")[0] in pdf_file.name:
+                    matching_files.append(str(pdf_file))
+
+        if not matching_files:
+            raise ToolError(
+                f"No downloaded paper found with ID: {paper_id_str}. "
+                f"Use download_paper first to download the paper."
+            )
+
+        # Use the first matching paper
+        target_filepath = matching_files[0]
+    else:
+        raise ToolError("Either filepath or paper_id must be provided")
+
+    # Check if file exists
+    if not os.path.exists(target_filepath):
+        raise ToolError(f"File not found: {target_filepath}")
+
+    # Check if it's a PDF file
+    if not target_filepath.lower().endswith(".pdf"):
+        raise ToolError("Only PDF files are supported for image extraction")
+
+    try:
+        # Extract images from PDF
+        images = await extract_images_from_pdf(target_filepath, max_pages, dpi)
+        
+        # Add metadata to the response
+        file_stat = os.stat(target_filepath)
+        file_size_mb = file_stat.st_size / (1024 * 1024)
+        
+        # Add file information to each image and format for MCP client
+        formatted_images = []
+        for img in images:
+            img["source_file"] = os.path.basename(target_filepath)
+            img["file_size_mb"] = round(file_size_mb, 1)
+            img["total_pages_in_pdf"] = len(images)
+            
+            # Create a data URI for better MCP client compatibility
+            img["image_url"] = f"data:image/png;base64,{img['image_data']}"
+            
+            formatted_images.append(img)
+
+        # Return the raw image data for internal use
+        return formatted_images
+
+    except Exception as e:
+        raise ToolError(f"Error extracting images from paper: {str(e)}")
+
+
+# MCP Resources for paper images - this is the main way to access paper images
+@mcp.resource("arxiv://{paper_id}/{resource_type}/{resource_path}")
+async def get_arxiv_resource(paper_id: str, resource_type: str, resource_path: str):
+    """
+    Provide arXiv resources including paper images, metadata, and content.
+    
+    Supported URI formats:
+    - arxiv://{paper_id}/image/{page_number}?dpi={dpi}  - Get paper page as image
+    - arxiv://{paper_id}/metadata  - Get paper metadata
+    - arxiv://{paper_id}/text?pages={max_pages}  - Get paper text content
+    
+    Examples:
+    - arxiv://1706.03762/image/1?dpi=150
+    - arxiv://1706.03762/metadata
+    - arxiv://1706.03762/text?pages=5
+    """
+    try:
+        # Construct the full URI for reference
+        uri = f"arxiv://{paper_id}/{resource_type}/{resource_path}"
+        
+        if resource_type == "image":
+            # Parse page number and optional DPI from resource_path
+            if "?" in resource_path:
+                page_info, params = resource_path.split("?", 1)
+                page_number = int(page_info)
+                
+                # Parse DPI parameter
+                dpi = 150  # default
+                for param in params.split("&"):
+                    if param.startswith("dpi="):
+                        dpi = int(param.split("=")[1])
+            else:
+                page_number = int(resource_path)
+                dpi = 150
+            
+            return await _get_paper_image_resource(paper_id, page_number, dpi, uri)
+            
+        elif resource_type == "metadata":
+            return await _get_paper_metadata_resource(paper_id, uri)
+            
+        elif resource_type == "text":
+            # Parse optional pages parameter from resource_path
+            max_pages = 10  # default
+            if "?" in resource_path:
+                params = resource_path.split("?", 1)[1]
+                for param in params.split("&"):
+                    if param.startswith("pages="):
+                        max_pages = int(param.split("=")[1])
+            
+            return await _get_paper_text_resource(paper_id, max_pages, uri)
+            
+        else:
+            raise ValueError(f"Unsupported resource type: {resource_type}")
+            
+    except Exception as e:
+        raise ToolError(f"Error providing arXiv resource: {str(e)}")
+
+
+async def _get_paper_image_resource(paper_id: str, page_number: int, dpi: int, uri: str):
+    """Get a specific page of a paper as an image resource."""
+    # Extract the specific page as image
+    images = await _extract_paper_images_internal(
+        paper_id=paper_id,
+        max_pages=page_number,  # Extract up to the requested page
+        dpi=dpi
+    )
+    
+    if not images:
+        raise ValueError(f"No images found for paper {paper_id}")
+    
+    # Find the specific page
+    target_image = None
+    for img in images:
+        if img["page_number"] == page_number:
+            target_image = img
+            break
+    
+    if not target_image:
+        raise ValueError(f"Page {page_number} not found in paper {paper_id}")
+    
+    # Return as MCP Resource dictionary
+    return {
+        "uri": uri,
+        "name": f"arXiv {paper_id} - Page {page_number}",
+        "description": f"Page {page_number} of arXiv paper {paper_id} as PNG image (DPI: {dpi})",
+        "mimeType": "image/png",
+        "text": f"Visual content of page {page_number} from arXiv paper {paper_id}. Contains figures, equations, and formatted text that can be analyzed by vision-capable AI models.",
+        "blob": target_image["image_data"]  # base64 encoded image data
+    }
+
+
+async def _get_paper_metadata_resource(paper_id: str, uri: str):
+    """Get metadata for a paper as a resource."""
+    try:
+        # Query arXiv for metadata using the global function
+        papers = await arxiv_query(id_list=paper_id, max_results=1)
+        
+        if not papers:
+            raise ValueError(f"Paper {paper_id} not found")
+        
+        paper = papers[0]
+        
+        # Format metadata as readable text
+        metadata_text = f"""arXiv Paper Metadata: {paper_id}
+
+Title: {paper['title']}
+
+Authors: {', '.join(paper['authors'])}
+
+Abstract: {paper['abstract']}
+
+Categories: {', '.join(paper['categories'])}
+
+Published: {paper['published']}
+Updated: {paper['updated']}
+
+PDF URL: {paper['pdf_url']}
+Abstract URL: {paper['abs_url']}
+"""
+        
+        if paper.get('doi'):
+            metadata_text += f"DOI: {paper['doi']}\n"
+        if paper.get('journal_ref'):
+            metadata_text += f"Journal Reference: {paper['journal_ref']}\n"
+        if paper.get('comment'):
+            metadata_text += f"Comments: {paper['comment']}\n"
+        
+        return {
+            "uri": uri,
+            "name": f"arXiv {paper_id} - Metadata",
+            "description": f"Complete metadata for arXiv paper {paper_id}",
+            "mimeType": "text/plain",
+            "text": metadata_text
+        }
+        
+    except Exception as e:
+        raise ValueError(f"Error getting metadata for {paper_id}: {str(e)}")
+
+
+async def _get_paper_text_resource(paper_id: str, max_pages: int, uri: str):
+    """Get text content of a paper as a resource."""
+    try:
+        # Read paper text content
+        content = await read_paper(paper_id=paper_id, max_pages=max_pages, max_chars=100000)
+        
+        return {
+            "uri": uri,
+            "name": f"arXiv {paper_id} - Text Content",
+            "description": f"Text content of arXiv paper {paper_id} (first {max_pages} pages)",
+            "mimeType": "text/plain",
+            "text": content
+        }
+        
+    except Exception as e:
+        raise ValueError(f"Error getting text content for {paper_id}: {str(e)}")
+
+
+# Legacy resource handler for backward compatibility
+@mcp.resource("paper-image://{paper_id}/{page_info}")
+async def get_paper_image_resource_legacy(paper_id: str, page_info: str):
+    """Legacy resource handler for paper-image:// URIs. Use arxiv:// instead."""
+    try:
+        # Construct the full URI for reference
+        uri = f"paper-image://{paper_id}/{page_info}"
+        
+        # Parse page number and optional DPI
+        if "?" in page_info:
+            page_number, params = page_info.split("?", 1)
+            page_number = int(page_number)
+            
+            # Parse DPI parameter
+            dpi = 150  # default
+            for param in params.split("&"):
+                if param.startswith("dpi="):
+                    dpi = int(param.split("=")[1])
+        else:
+            page_number = int(page_info)
+            dpi = 150
+        
+        return await _get_paper_image_resource(paper_id, page_number, dpi, uri)
+        
+    except Exception as e:
+        raise ToolError(f"Error providing image resource: {str(e)}")
+
+
+@mcp.tool
+async def get_paper_resources(
+    paper_id: str,
+    resource_types: list[str] = ["image"],
+    max_pages: int = 3,
+    dpi: int = 150
+) -> dict:
+    """
+    Generate MCP resource URIs for arXiv papers that can be directly referenced by AI models.
+    
+    This is the main way to access arXiv paper content as MCP resources. The generated URIs
+    can be referenced in conversations and will be automatically loaded by compatible MCP clients.
+    
+    Args:
+        paper_id: arXiv paper ID (e.g., "1706.03762")
+        resource_types: Types of resources to generate (default: ["image"])
+                       Options: "image", "metadata", "text"
+        max_pages: For image/text resources, maximum number of pages (default: 3)
+        dpi: For image resources, resolution (default: 150)
+    
+    Returns:
+        Dictionary with resource URIs organized by type
+    
+    Examples:
+        # Get image resources
+        resources = await get_paper_resources("1706.03762", ["image"], max_pages=2)
+        # Returns: {"images": [{"uri": "arxiv://1706.03762/image/1?dpi=150", ...}]}
+        
+        # Get all resource types
+        resources = await get_paper_resources("1706.03762", ["image", "metadata", "text"])
+        
+    Usage in conversation:
+        "Please analyze this paper's first page: arxiv://1706.03762/image/1"
+        "Show me the metadata: arxiv://1706.03762/metadata"
+    """
+    paper_id_str = format_arxiv_id(paper_id)
+    
+    # For metadata, we don't need local files - can query arXiv directly
+    need_local_files = any(rt in resource_types for rt in ["image", "text"])
+    
+    if need_local_files:
+        # Verify the paper exists locally
+        scan_dir = Path(os.getcwd()) / "papers"
+        if not scan_dir.exists():
+            raise ToolError(f"No papers directory found. Download paper {paper_id_str} first.")
+        
+        # Find the paper file
+        pdf_files = list(scan_dir.glob("*.pdf"))
+        matching_files = []
+        
+        import re
+        arxiv_pattern = r"(\d{4}\.\d{4,5}(v\d+)?)"
+        
+        for pdf_file in pdf_files:
+            filename = pdf_file.stem
+            matches = re.findall(arxiv_pattern, filename)
+            for match in matches:
+                file_id = match[0]
+                exact_match = file_id == paper_id_str
+                base_match = file_id.split("v")[0] == paper_id_str.split("v")[0]
+                if exact_match or base_match:
+                    matching_files.append(str(pdf_file))
+                    break
+        
+        if not matching_files:
+            raise ToolError(f"Paper {paper_id_str} not found locally. Use download_paper first.")
+    
+    # Generate resources by type
+    result = {}
+    
+    if "image" in resource_types:
+        images = []
+        for page_num in range(1, max_pages + 1):
+            uri = f"arxiv://{paper_id_str}/image/{page_num}?dpi={dpi}"
+            images.append({
+                "uri": uri,
+                "page_number": page_num,
+                "paper_id": paper_id_str,
+                "dpi": dpi,
+                "resource_type": "image",
+                "description": f"Page {page_num} of arXiv paper {paper_id_str} as image",
+                "usage": "Reference this URI in conversation - MCP clients will show the image"
+            })
+        result["images"] = images
+    
+    if "metadata" in resource_types:
+        metadata_uri = f"arxiv://{paper_id_str}/metadata"
+        result["metadata"] = {
+            "uri": metadata_uri,
+            "paper_id": paper_id_str,
+            "resource_type": "metadata",
+            "description": f"Complete metadata for arXiv paper {paper_id_str}",
+            "usage": "Reference this URI to get paper title, authors, abstract, etc."
+        }
+    
+    if "text" in resource_types:
+        text_uri = f"arxiv://{paper_id_str}/text?pages={max_pages}"
+        result["text"] = {
+            "uri": text_uri,
+            "paper_id": paper_id_str,
+            "max_pages": max_pages,
+            "resource_type": "text",
+            "description": f"Text content of arXiv paper {paper_id_str} (first {max_pages} pages)",
+            "usage": "Reference this URI to get the paper's text content"
+        }
+    
+    # Add summary
+    result["summary"] = f"Generated {len(resource_types)} resource type(s) for paper {paper_id_str}"
+    result["usage_instructions"] = [
+        "Copy any URI from the results and reference it directly in your conversation",
+        "Example: 'Please analyze this image: arxiv://1706.03762/image/1'",
+        "Compatible MCP clients will automatically load the referenced resources"
+    ]
+    
+    return result
 
 
 # Custom HTTP routes
